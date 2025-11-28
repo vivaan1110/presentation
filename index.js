@@ -1,129 +1,60 @@
-const fs = require('mz/fs');
-const path = require('path');
 const http = require('http');
-const url = require('url');
-const { Readable } = require('stream');
-const colors = require('colors/safe');
 
-// Setup frames in memory
-// Load frames into memory once
-let original = [];
-let flipped = [];
+// ANSI Escape Codes: ये टर्मिनल को रंग बदलने और कर्सर को लाइन की शुरुआत में लाने का निर्देश देते हैं।
+// \x1b[31m: लाल रंग | \x1b[90m: हल्का ग्रे रंग (बंद) | \x1b[0m: रंग रीसेट
+// \r: Carriage Return (कर्सर को लाइन की शुरुआत में लाता है, जिससे पिछली लाइन ओवरराइट हो जाती है)
+const ON_LED = '\x1b[31m\x1b[1m [ ON ] \x1b[0m\r';    // लाल रंग में "ON"
+const OFF_LED = '\x1b[90m [ OFF ] \x1b[0m\r';  // ग्रे रंग में "OFF"
 
-(async () => {
-  const framesPath = 'frames';
-  const files = await fs.readdir(framesPath);
-
-  original = await Promise.all(files.map(async (file) => {
-    const frame = await fs.readFile(path.join(framesPath, file));
-    return frame.toString();
-  }));
-  flipped = original.map(f => {
-    return f
-      .toString()
-      .split('')
-      .reverse()
-      .join('')
-  })
-})().catch((err) => {
-  console.log('Error loading frames');
-  console.log(err);
-});
-
-const colorsOptions = [
-  'red',
-  'yellow',
-  'green',
-  'blue',
-  'magenta',
-  'cyan',
-  'white'
-];
-const numColors = colorsOptions.length;
-const selectColor = previousColor => {
-  let color;
-
-  do {
-    color = Math.floor(Math.random() * numColors);
-  } while (color === previousColor);
-
-  return color;
-};
-
-function streamer(stream, opts) {
-  const frames = opts.flip ? flipped : original;
-  let index = 0;
-  let lastColor;
-  let timer;
-
-  function tick() {
-    // clear screen
-    stream.push('\u001b[2J\u001b[3J\u001b[H');
-
-    // color frame
-    const colorIdx = lastColor = selectColor(lastColor);
-    const coloredFrame = colors[colorsOptions[colorIdx]](frames[index]);
-
-    // try to push; respect backpressure
-    const ok = stream.push(coloredFrame);
-    index = (index + 1) % frames.length;
-
-    if (ok) {
-      timer = setTimeout(tick, 70);
-    } else {
-      stream.once('drain', () => {
-        timer = setTimeout(tick, 70);
-      });
-    }
-  }
-
-  // start
-  tick();
-
-  // cleanup function
-  return () => {
-    clearTimeout(timer);
-  };
-}
-
-const validateQuery = ({ flip }) => ({ flip: String(flip).toLowerCase() === 'true' });
+const port = process.env.PORT || 3000;
+const frameDelay = 500; // 500 मिलीसेकंड का विलंब
 
 const server = http.createServer((req, res) => {
-  // Healthcheck route
-  if (req.url === '/healthcheck') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok' }));
-  }
+    // स्ट्रीमिंग के लिए Headers सेट करें
+    res.writeHead(200, {
+        'Content-Type': 'text/plain',
+        'Transfer-Encoding': 'chunked', // स्ट्रीमिंग के लिए जरूरी
+        'Connection': 'keep-alive'
+    });
 
-  if (
-    req.headers &&
-    req.headers['user-agent'] &&
-    !req.headers['user-agent'].includes('curl')
-  ) {
-    res.writeHead(302, { Location: 'https://github.com/hugomd/parrot.live' });
-    return res.end();
-  }
+    let frame = 0;
+    let isConnected = true;
 
-  const stream = new Readable({ read() {} });
-  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-  stream.pipe(res);
+    // एनिमेशन लूप (Loop)
+    function animate() {
+        if (!isConnected) return;
 
-  // Start streaming with cleanup handler
-  const opts = validateQuery(url.parse(req.url, true).query);
-  const cleanupLoop = streamer(stream, opts);
+        // हर दूसरे फ्रेम पर ON और OFF स्विच करें
+        const output = (frame % 2 === 0) ? ON_LED : OFF_LED;
+        res.write(output); // टर्मिनल पर फ्रेम भेजें
 
-  // Clean up when the client disconnects
-  const onClose = () => {
-    cleanupLoop();
-    stream.destroy();
-  };
-  res.on('close', onClose);
-  res.on('error', onClose);
+        frame++;
+
+        // लूप को जारी रखें
+        if (isConnected) {
+            setTimeout(animate, frameDelay);
+        }
+    }
+
+    // एनिमेशन शुरू करें
+    animate();
+
+    // जब क्लाइंट डिस्कनेक्ट हो जाए (जैसे यूजर Ctrl+C दबाए)
+    res.on('close', () => {
+        isConnected = false;
+        // setTimeout लूप अपने आप बंद हो जाएगा
+    });
+
+    // 60 सेकंड बाद सर्वर कनेक्शन बंद कर देगा (सुरक्षा के लिए)
+    setTimeout(() => {
+        if (isConnected) {
+            isConnected = false;
+            res.end();
+        }
+    }, 60000); 
+
 });
 
-const port = process.env.PARROT_PORT || 3000;
-server.listen(port, err => {
-  if (err) throw err;
-  console.log(`Listening on http://localhost:${port}`);
+server.listen(port, () => {
+    console.log(`Server running on port ${port}`);
 });
-
